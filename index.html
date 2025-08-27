@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Road Network — OSM Style (Hong Kong)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Convert Overpass JSON -> GeoJSON -->
+  <script src="https://unpkg.com/osmtogeojson@3.0.0-beta.5/osmtogeojson.js"></script>
+
+  <style>
+    :root { --bg:#fff; --ink:#000; --node:#f29f05; --muted:#666; --accent:#111; --warn:#b00020; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    header { padding: 12px 14px; display: grid; gap: 10px; grid-template-columns: 1fr auto auto; align-items: end; border-bottom:1px solid #eee; }
+    h1 { font-size: 16px; margin: 0; font-weight: 700; color: var(--accent); }
+    label { display:block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    input, select, button {
+      background:#fff; color:#111; border:1px solid #cfcfcf; border-radius:8px;
+      padding:10px 12px; font-size:14px;
+    }
+    input { width: 340px; }
+    button { background:#111; color:#fff; border:0; cursor:pointer; font-weight:600; }
+    .toolbar { display:flex; gap:10px; align-items:end; }
+    #map { height: calc(100% - 92px); background:#ffffff; }
+    .error { color: var(--warn); margin-left:16px; }
+    .banner { background:#fff4f4; color:var(--warn); border-bottom:1px solid #ffd9d9; padding:8px 14px; display:none; }
+    .fineprint { font-size: 11px; color:#999; padding: 6px 14px 0; }
+    @media (max-width: 860px) {
+      header { grid-template-columns: 1fr; }
+      input { width: 100%; }
+      #map { height: calc(100% - 152px); }
+    }
+    .leaflet-control-attribution { display: none; } /* keep the minimalist look */
+  </style>
+</head>
+<body>
+  <div class="banner" id="fileWarning">
+    You opened this page directly from your file system. Some browsers block cross-origin requests in this mode,
+    which causes “Failed to fetch”. Run a tiny server instead:
+    <code>python -m http.server 8080</code> then open <a href="http://localhost:8080/" target="_blank">http://localhost:8080/</a>
+  </div>
+
+  <header>
+    <h1>Road Network — OSM Style</h1>
+    <div class="toolbar">
+      <div>
+        <label for="place">Location (e.g., Hong Kong, Oxford UK, Manhattan USA)</label>
+        <input id="place" placeholder="e.g., Hong Kong" value="Hong Kong" />
+      </div>
+      <div>
+        <label for="net">Network</label>
+        <select id="net">
+          <option value="drive" selected>drive (roads)</option>
+          <option value="walk">walk (footways/paths)</option>
+          <option value="bike">bike (cycleways)</option>
+          <option value="all">all highways</option>
+        </select>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="go">Draw network</button>
+      </div>
+    </div>
+    <div class="error" id="err"></div>
+  </header>
+
+  <div id="map"></div>
+  <div class="fineprint">Data © OpenStreetMap contributors • Rendered in your browser (no server required)</div>
+
+  <script>
+    // =============== Leaflet on a white canvas (OSMnx-like look) ===============
+    const map = L.map('map', { zoomControl: true, attributionControl: false });
+    L.control.scale({ imperial: false }).addTo(map);
+    let roadsLayer = null, nodesLayer = null;
+
+    // Show warning if opened via file://
+    if (location.protocol === 'file:') {
+      document.getElementById('fileWarning').style.display = 'block';
+    }
+
+    // =============== Overpass robustness ===============
+    const OVERPASS_ENDPOINTS = [
+      'https://overpass.kumi.systems/api/interpreter',
+      'https://overpass-api.de/api/interpreter',
+      'https://overpass.openstreetmap.fr/api/interpreter',
+      'https://overpass.openstreetmap.ru/api/interpreter',
+      'https://overpass.nchc.org.tw/api/interpreter'
+    ];
+
+    const filters = {
+      drive:  '(highway~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|service|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$")',
+      walk:   '(highway~"^(footway|path|pedestrian|steps|track)$"|sidewalk=yes|foot=designated)',
+      bike:   '(highway~"^(cycleway)$"|bicycle=designated|cycleway~".+")',
+      all:    '(highway)'
+    };
+
+    let currentGeocodeAbort = null;
+    let currentOverpassAbort = null;
+
+    function setError(msg) {
+      const el = document.getElementById('err');
+      const hint = /Failed to fetch|TypeError|NetworkError|429|timeout|Too many|quota|HTTP 5\d{2}/i.test(msg || '')
+        ? ' — If you’re testing locally, serve the file (see red banner). You can also try again or choose a smaller area.'
+        : '';
+      el.textContent = (msg || '') + hint;
+    }
+
+    function overpassQuery(bbox, net) {
+      const [s,w,n,e] = bbox.map(Number);
+      const filt = filters[net] || filters.drive;
+      return `
+        /* Road Network (GitHub Pages) */
+        [out:json][timeout:60];
+        (
+          way${filt}(${s},${w},${n},${e});
+        );
+        (._;>;);
+        out body;
+      `;
+    }
+
+    // Clamp bbox to avoid giant queries (Hong Kong is fine; this also protects from "World")
+    function clampBBox(bbox, maxSpanDeg = 1.2) {
+      let [s,w,n,e] = bbox.map(Number);
+      const latSpan = n - s, lonSpan = e - w;
+      const scale = Math.max(latSpan / maxSpanDeg, lonSpan / maxSpanDeg, 1);
+      if (scale > 1) {
+        const latMid = (n + s) / 2, lonMid = (e + w) / 2;
+        const newHalfLat = (latSpan / scale) / 2;
+        const newHalfLon = (lonSpan / scale) / 2;
+        s = latMid - newHalfLat; n = latMid + newHalfLat;
+        w = lonMid - newHalfLon; e = lonMid + newHalfLon;
+      }
+      return [s,w,n,e];
+    }
+
+    async function geocode(place) {
+      try { if (currentGeocodeAbort) currentGeocodeAbort.abort(); } catch {}
+      currentGeocodeAbort = new AbortController();
+      const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&polygon_geojson=0&q=${encodeURIComponent(place)}`;
+      const res = await fetch(url, { headers: { 'Accept-Language': 'en' }, signal: currentGeocodeAbort.signal });
+      if (!res.ok) throw new Error(`Geocoding failed (HTTP ${res.status})`);
+      const data = await res.json();
+      if (!data.length) throw new Error('No results for that place');
+      const [south, north, west, east] = data[0].boundingbox.map(Number); // [s, n, w, e]
+      return [south, west, north, east]; // [s, w, n, e]
+    }
+
+    // Try POST first, then fallback to GET ?data= to dodge some CORS setups
+    async function fetchOverpass(endpoint, ql, signal) {
+      // Attempt POST
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'application/json' },
+          body: ql,
+          signal
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text().catch(()=>'')}`);
+        return await res.json();
+      } catch (e) {
+        // Fallback to GET ?data= (short query -> short URL is fine)
+        const url = endpoint + '?data=' + encodeURIComponent(ql);
+        const res2 = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' }, signal });
+        if (!res2.ok) throw new Error(`HTTP ${res2.status} — ${await res2.text().catch(()=>'')}`);
+        return await res2.json();
+      }
+    }
+
+    async function fetchRoads(bbox, net, maxRetries = 4) {
+      try { if (currentOverpassAbort) currentOverpassAbort.abort(); } catch {}
+      currentOverpassAbort = new AbortController();
+
+      const ql = overpassQuery(clampBBox(bbox), net);
+      let lastErr = null;
+
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const endpoint = OVERPASS_ENDPOINTS[attempt % OVERPASS_ENDPOINTS.length];
+        try {
+          const json = await fetchOverpass(endpoint, ql, currentOverpassAbort.signal);
+          return osmtogeojson(json);
+        } catch (err) {
+          lastErr = err;
+          const delay = 600 * Math.pow(2, attempt);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+      throw lastErr || new Error('Overpass request failed (unknown error)');
+    }
+
+    // =============== Styling like your OSMnx figure ===============
+    function lineStyle() { return { color: '#000000', weight: 1.2, opacity: 1 }; }
+    function nodeStyle() { return { radius: 2, weight: 0, fillColor: '#f29f05', fillOpacity: 1, color: '#f29f05' }; }
+
+    function pointsFromLines(geojson) {
+      const seen = new Set(), features = [];
+      const push = (lat, lng) => {
+        const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [lng, lat] }, properties: {} });
+      };
+      (geojson.features || []).forEach(f => {
+        const g = f.geometry; if (!g) return;
+        if (g.type === 'LineString') g.coordinates.forEach(([lng, lat]) => push(lat, lng));
+        else if (g.type === 'MultiLineString') g.coordinates.forEach(line => line.forEach(([lng, lat]) => push(lat, lng)));
+      });
+      return { type: 'FeatureCollection', features };
+    }
+
+    function drawNetwork(geojson) {
+      if (roadsLayer) map.removeLayer(roadsLayer);
+      if (nodesLayer) map.removeLayer(nodesLayer);
+
+      roadsLayer = L.geoJSON(geojson, {
+        style: lineStyle,
+        filter: f => f.geometry && (f.geometry.type === 'LineString' || f.geometry.type === 'MultiLineString')
+      }).addTo(map);
+
+      const pts = pointsFromLines(geojson);
+      nodesLayer = L.geoJSON(pts, {
+        pointToLayer: (f, latlng) => L.circleMarker(latlng, nodeStyle())
+      }).addTo(map);
+
+      try {
+        const b = roadsLayer.getBounds();
+        if (b.isValid()) map.fitBounds(b.pad(0.02));
+      } catch {}
+    }
+
+    // =============== Main flow ===============
+    async function run() {
+      setError('');
+      const place = document.getElementById('place').value.trim();
+      const net = document.getElementById('net').value;
+      if (!place) return;
+
+      const btn = document.getElementById('go');
+      const prev = btn.textContent;
+      btn.textContent = 'Drawing…';
+      btn.disabled = true;
+
+      try {
+        const bbox = await geocode(place);
+        const [s,w,n,e] = bbox;
+        const tmp = L.latLngBounds([[s,w],[n,e]]);
+        if (tmp.isValid()) map.fitBounds(tmp);
+
+        await new Promise(r => setTimeout(r, 400)); // be polite to free services
+        const geo = await fetchRoads(bbox, net);
+        drawNetwork(geo);
+      } catch (err) {
+        setError(err.message || String(err));
+      } finally {
+        btn.textContent = prev;
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById('go').addEventListener('click', run);
+    document.getElementById('place').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); run(); }
+    });
+
+    // Initial render: Hong Kong
+    (function init() {
+      map.setView([22.285, 114.158], 11);
+      run();
+    })();
+  </script>
+</body>
+</html>
